@@ -72,7 +72,7 @@
 
 		simple-audio-card,hp-det-gpio = <&gpio1 RK_PC4 GPIO_ACTIVE_LOW>;
 		simple-audio-card,aux-devs = <&amp_headphone>, <&amp_speaker>;
-		simple-audio-card,pin-switches = "Headphone", "Speaker";
+		simple-audio-card,pin-switches = "Headphones", "Speaker";
 
 		simple-audio-card,cpu {
 			sound-dai = <&i2s0_8ch>;
@@ -94,11 +94,19 @@
 		};
 	};
 
+	hdmi1-con {
+		compatible = "hdmi-connector";
+		type = "a";
+
+		port {
+			hdmi1_con_in: endpoint {
+				remote-endpoint = <&hdmi1_out_con>;
+			};
+		};
+	};
 	leds {
 		compatible = "gpio-leds";
         status = "okay";
-        /* pinctrl-names = "default"; */
-		/* pinctrl-0 = <&power_led_gpio &status_led_gpio>; */
 
 		power_led: power-led {
 			color = <LED_COLOR_ID_GREEN>;
@@ -147,6 +155,21 @@
 			/* press-threshold-microvolt = <1235000>; */
 		/* }; */
 	/* }; */
+
+	rfkill {
+		compatible = "rfkill-gpio";
+		label = "rfkill-pcie-wlan";
+		radio-type = "wlan";
+		/* shutdown-gpios = <&gpio4 RK_PA2 GPIO_ACTIVE_HIGH>; */
+	};
+
+	rfkill-bt {
+		compatible = "rfkill-gpio";
+		label = "rfkill-m2-bt";
+		radio-type = "bluetooth";
+		/* shutdown-gpios = <&gpio3 RK_PD5 GPIO_ACTIVE_HIGH>; */
+	};
+
 
     pcie20_avdd0v85: pcie20-avdd0v85-regulator {
 		compatible = "regulator-fixed";
@@ -314,15 +337,15 @@
 		vin-supply = <&vcc5v0_sys>;
 	};
 
-	wireless_wlan: wireless-wlan {
-		compatible = "wlan-platdata";
-		wifi_chip_type = "rtl8852bs";
-		pinctrl-names = "default";
-		pinctrl-0 = <&wifi_host_wake_irq>, <&wifi_poweren_gpio>;
-		WIFI,host_wake_irq = <&gpio2 RK_PB4 GPIO_ACTIVE_HIGH>;
-		WIFI,poweren_gpio = <&gpio2 RK_PB5 GPIO_ACTIVE_HIGH>;
-		status = "okay";
-	};
+/* 	wireless_wlan: wireless-wlan { */
+/* 		compatible = "wlan-platdata"; */
+/* 		wifi_chip_type = "rtl8852bs"; */
+/* 		pinctrl-names = "default"; */
+/* 		pinctrl-0 = <&wifi_host_wake_irq>, <&wifi_poweren_gpio>; */
+/* 		WIFI,host_wake_irq = <&gpio2 RK_PB4 GPIO_ACTIVE_HIGH>; */
+/* 		WIFI,poweren_gpio = <&gpio2 RK_PB5 GPIO_ACTIVE_HIGH>; */
+/* 		status = "okay"; */
+/* 	}; */
 };
 
 
@@ -426,6 +449,41 @@
 &hdptxphy0 {
 	status = "okay";
 };
+
+&hdmi1 {
+    enable-gpios = <&gpio1 RK_PA7 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
+&hdmi1_in {
+	hdmi1_in_vp1: endpoint {
+		remote-endpoint = <&vp1_out_hdmi1>;
+	};
+};
+
+&hdmi1_out {
+	hdmi1_out_con: endpoint {
+		remote-endpoint = <&hdmi1_con_in>;
+	};
+};
+
+&hdmi1_sound {
+	status = "okay";
+};
+
+&hdptxphy1 {
+	status = "okay";
+};
+
+/* &hdmi_receiver_cma { */
+/* 	status = "okay"; */
+/* }; */
+
+/* &hdmi_receiver { */
+/*     hpd-trigger-level = <1>; */
+/* 	hpd-gpios = <&gpio4 RK_PB0 GPIO_ACTIVE_LOW>; */
+/* 	status = "okay"; */
+/* }; */
 
 &i2c0 {
 	pinctrl-0 = <&i2c0m2_xfer>;
@@ -626,7 +684,6 @@
 	status = "okay";
 };
 
-
 &mdio1 {
 	rgmii_phy: phy@1 {
 		compatible = "ethernet-phy-ieee802.3-c22";
@@ -651,6 +708,7 @@
 	bus-width = <4>;
 	cap-mmc-highspeed;
 	cap-sd-highspeed;
+	cd-gpios = <&gpio0 RK_PA4 GPIO_ACTIVE_LOW>;
 	disable-wp;
 	max-frequency = <200000000>;
 	no-mmc;
@@ -658,6 +716,24 @@
 	sd-uhs-sdr104;
 	vmmc-supply = <&vcc_3v3_s3>;
 	vqmmc-supply = <&vccio_sd_s0>;
+	status = "okay";
+};
+
+&sdio {
+	max-frequency = <150000000>;
+	no-sd;
+	no-mmc;
+	bus-width = <4>;
+	disable-wp;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	mmc-pwrseq = <&sdio_pwrseq>;
+	non-removable;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdiom0_pins>;
+	vmmc-supply = <&vcc_3v3_s3>;
+	vqmmc-supply = <&vcc_1v8_s3>;
 	status = "okay";
 };
 
@@ -1051,25 +1127,25 @@
 	reset-gpios = <&gpio4 RK_PA5 GPIO_ACTIVE_HIGH>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie2_0_rst>;
-	status = "disabled";
+	status = "okay";
 };
 
 &pcie2x1l1 {
 	reset-gpios = <&gpio4 RK_PA2 GPIO_ACTIVE_HIGH>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie2_1_rst>;
-	status = "disabled";
+	status = "okay";
 };
 
 &pcie30phy {
-	status = "disabled";
+	status = "okay";
 };
 
 &pcie3x4 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie3_reset>;
 	reset-gpios = <&gpio4 RK_PB6 GPIO_ACTIVE_HIGH>;
-	status = "disabled";
+	status = "okay";
 };
 
 &pinctrl {
@@ -1106,6 +1182,12 @@
 				<0 RK_PC4 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
+
+	/* hdmirx { */
+	/* 	hdmirx_hpd: hdmirx-5v-detection { */
+	/* 		rockchip,pins = <4 RK_PB0 RK_FUNC_GPIO &pcfg_pull_none>; */
+	/* 	}; */
+	/* }; */
 
 	hym8563 {
 		rtc_int: rtc-int {
@@ -1151,15 +1233,15 @@
 				<4 RK_PC6 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 
-		wifi_host_wake_irq: wifi-host-wake-irq {
-			rockchip,pins =
-				<2 RK_PB4 RK_FUNC_GPIO &pcfg_pull_none>;
-		};
+		/* wifi_host_wake_irq: wifi-host-wake-irq { */
+		/* 	rockchip,pins = */
+		/* 		<2 RK_PB4 RK_FUNC_GPIO &pcfg_pull_none>; */
+		/* }; */
 
-		wifi_poweren_gpio: wifi-poweren-gpio {
-			rockchip,pins =
-				<2 RK_PB5 RK_FUNC_GPIO &pcfg_pull_none>;
-		};
+		/* wifi_poweren_gpio: wifi-poweren-gpio { */
+		/* 	rockchip,pins = */
+		/* 		<2 RK_PB5 RK_FUNC_GPIO &pcfg_pull_none>; */
+		/* }; */
 	};
 
 };
@@ -1336,5 +1418,12 @@
 	vp0_out_hdmi0: endpoint@ROCKCHIP_VOP2_EP_HDMI0 {
 		reg = <ROCKCHIP_VOP2_EP_HDMI0>;
 		remote-endpoint = <&hdmi0_in_vp0>;
+	};
+};
+
+&vp1 {
+	vp1_out_hdmi1: endpoint@ROCKCHIP_VOP2_EP_HDMI1 {
+		reg = <ROCKCHIP_VOP2_EP_HDMI1>;
+		remote-endpoint = <&hdmi1_in_vp1>;
 	};
 };
