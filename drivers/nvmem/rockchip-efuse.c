@@ -12,6 +12,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/nvmem-provider.h>
+#include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -54,6 +55,7 @@ struct rockchip_efuse_chip {
 	struct device *dev;
 	void __iomem *base;
 	struct clk *clk;
+	struct regulator *vqps;
 };
 
 /**
@@ -243,6 +245,13 @@ static int rockchip_rk3399_efuse_write(void *context, unsigned int offset,
 		return ret;
 	}
 
+	ret = regulator_enable(efuse->vqps);
+	if (ret < 0) {
+		dev_err(efuse->dev, "failed to enable vqps regulator\n");
+		clk_disable_unprepare(efuse->clk);
+		return ret;
+	}
+
 	while (bytes--) {
 		u8 byte = *buf++;
 		int bit;
@@ -282,6 +291,7 @@ static int rockchip_rk3399_efuse_write(void *context, unsigned int offset,
 	/* Return to standby mode: PD=H, CSB=H */
 	writel(RK3399_PD | RK3399_CSB, efuse->base + REG_EFUSE_CTRL);
 
+	regulator_disable(efuse->vqps);
 	clk_disable_unprepare(efuse->clk);
 
 	return 0;
@@ -377,11 +387,31 @@ static int rockchip_efuse_probe(struct platform_device *pdev)
 				 &econfig.size))
 		econfig.size = resource_size(res);
 
-	econfig.reg_read  = soc_data->reg_read;
-	econfig.reg_write = soc_data->reg_write;
-	econfig.read_only = !soc_data->reg_write;
-	econfig.priv      = efuse;
-	econfig.dev       = dev;
+	econfig.reg_read = soc_data->reg_read;
+	econfig.priv     = efuse;
+	econfig.dev      = dev;
+
+	/*
+	 * Enable write support only when a VQPS programming supply is
+	 * described in the device tree. Its presence is the hardware
+	 * declaration that irreversible OTP programming is intended on
+	 * this board. VQPS must be 0V during reads (the regulator is
+	 * only enabled inside the write callback).
+	 */
+	if (soc_data->reg_write) {
+		efuse->vqps = devm_regulator_get_optional(dev, "vqps");
+		if (!IS_ERR(efuse->vqps)) {
+            dev_info("regulator present for efuse\n");
+			econfig.reg_write = soc_data->reg_write;
+		} else if (PTR_ERR(efuse->vqps) == -ENODEV) {
+			efuse->vqps = NULL;
+			dev_dbg(dev, "vqps supply absent, write support disabled\n");
+		} else {
+			return PTR_ERR(efuse->vqps);
+		}
+	}
+
+	econfig.read_only = !econfig.reg_write;
 
 	nvmem = devm_nvmem_register(dev, &econfig);
 
