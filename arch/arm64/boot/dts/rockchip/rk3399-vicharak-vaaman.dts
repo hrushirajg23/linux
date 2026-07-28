@@ -36,6 +36,15 @@
 		regulator-max-microvolt = <12000000>;
 	};
 
+	vcc1v8_efuse: regulator-vcc1v8-efuse {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc1v8_efuse";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+	};
+
 	vcc3v3_lan: regulator-vcc3v3-lan {
 		compatible = "regulator-fixed";
 		regulator-name = "vcc3v3_lan";
@@ -105,6 +114,11 @@
 &emmc_phy {
 	rockchip,enable-strobe-pulldown;
 	status = "okay";
+};
+
+&efuse0 {
+    vqps-supply = <&vcc1v8_efuse>;
+    status = "okay";
 };
 
 &gmac {
