@@ -27,6 +27,11 @@ properties:
       # Deprecated: old compatible value for rk3066a, rk3188 and rk3288
       - rockchip,rockchip-efuse
 
+  vqps-supply:
+    description:
+      Supply for the eFuse programming voltage (VQPS), required only
+      on boards where software-initiated OTP programming is intended.
+
   reg:
     description:
       Registers location and eFuse size.
