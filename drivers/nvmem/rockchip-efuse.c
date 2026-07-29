@@ -12,10 +12,12 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/nvmem-provider.h>
+#include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <asm/unaligned.h>
 
 #define RK3288_A_SHIFT		6
 #define RK3288_A_MASK		0x3ff
@@ -37,11 +39,17 @@
 #define RK3399_NBYTES		4
 #define RK3399_STROBSFTSEL	BIT(9)
 #define RK3399_RSB		BIT(7)
+#define RK3399_PS		BIT(4)
 #define RK3399_PD		BIT(5)
 #define RK3399_PGENB		BIT(3)
 #define RK3399_LOAD		BIT(2)
 #define RK3399_STROBE		BIT(1)
 #define RK3399_CSB		BIT(0)
+#define RK3399_VQPS_MIN_UV	1800000
+#define RK3399_VQPS_MAX_UV	1980000
+
+/* Program time per TRM Section 21.1: 12us +/- 1us; use 15us for margin */
+#define RK3399_PGM_TIME_US	15
 
 #define REG_EFUSE_CTRL		0x0000
 #define REG_EFUSE_DOUT		0x0004
@@ -50,6 +58,19 @@ struct rockchip_efuse_chip {
 	struct device *dev;
 	void __iomem *base;
 	struct clk *clk;
+	struct regulator *vqps;
+	/* Lock to serialize concurrent efuse read and write operations */
+	struct mutex lock;
+};
+
+/**
+ * struct rockchip_efuse_soc_data - per-SoC efuse callbacks
+ * @reg_read:  mandatory read callback
+ * @reg_write: optional write callback; NULL means read-only
+ */
+struct rockchip_efuse_soc_data {
+	int (*reg_read)(void *ctx, unsigned int offset, void *val, size_t bytes);
+	int (*reg_write)(void *ctx, unsigned int offset, void *val, size_t bytes);
 };
 
 static int rockchip_rk3288_efuse_read(void *context, unsigned int offset,
@@ -156,10 +177,12 @@ static int rockchip_rk3399_efuse_read(void *context, unsigned int offset,
 	u8 *buf;
 	int ret, i = 0;
 
+	mutex_lock(&efuse->lock);
+
 	ret = clk_prepare_enable(efuse->clk);
 	if (ret < 0) {
 		dev_err(efuse->dev, "failed to prepare/enable efuse clk\n");
-		return ret;
+		goto unlock;
 	}
 
 	addr_start = rounddown(offset, RK3399_NBYTES) / RK3399_NBYTES;
@@ -171,13 +194,18 @@ static int rockchip_rk3399_efuse_read(void *context, unsigned int offset,
 		      GFP_KERNEL);
 	if (!buf) {
 		clk_disable_unprepare(efuse->clk);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto unlock;
 	}
 
 	writel(RK3399_LOAD | RK3399_PGENB | RK3399_STROBSFTSEL | RK3399_RSB,
 	       efuse->base + REG_EFUSE_CTRL);
 	udelay(1);
+
 	while (addr_len--) {
+		writel(readl(efuse->base + REG_EFUSE_CTRL) &
+		       (~(RK3399_A_MASK << RK3399_A_SHIFT)),
+		       efuse->base + REG_EFUSE_CTRL);
 		writel(readl(efuse->base + REG_EFUSE_CTRL) | RK3399_STROBE |
 		       ((addr_start++ & RK3399_A_MASK) << RK3399_A_SHIFT),
 		       efuse->base + REG_EFUSE_CTRL);
@@ -187,7 +215,7 @@ static int rockchip_rk3399_efuse_read(void *context, unsigned int offset,
 		       efuse->base + REG_EFUSE_CTRL);
 		udelay(1);
 
-		memcpy(&buf[i], &out_value, RK3399_NBYTES);
+		put_unaligned_le32(out_value, &buf[i]);
 		i += RK3399_NBYTES;
 	}
 
@@ -199,52 +227,149 @@ static int rockchip_rk3399_efuse_read(void *context, unsigned int offset,
 	kfree(buf);
 
 	clk_disable_unprepare(efuse->clk);
+	ret = 0;
 
-	return 0;
+unlock:
+	mutex_unlock(&efuse->lock);
+	return ret;
 }
 
-static struct nvmem_config econfig = {
-	.name = "rockchip-efuse",
-	.add_legacy_fixed_of_cells = true,
-	.type = NVMEM_TYPE_OTP,
-	.stride = 1,
-	.word_size = 1,
-	.read_only = true,
+/**
+ * rockchip_rk3399_efuse_write - program fuse bits on RK3399 (A_PGM mode)
+ * @context: pointer to rockchip_efuse_chip
+ * @offset:  byte offset in the efuse space
+ * @val:     data to write (only set bits are programmed; OTP cannot clear)
+ * @bytes:   number of bytes
+ *
+ * Each bit is programmed individually using a hardware-timed STROBE pulse.
+ * The caller must ensure VQPS (1.8V~1.98V) is present during the write.
+ * Per TRM Section 21.6, only one bit is programmed per STROBE cycle.
+ */
+static int rockchip_rk3399_efuse_write(void *context, unsigned int offset,
+				       void *val, size_t bytes)
+{
+	struct rockchip_efuse_chip *efuse = context;
+	u8 *buf = val;
+	int ret;
+
+	mutex_lock(&efuse->lock);
+
+	ret = clk_prepare_enable(efuse->clk);
+	if (ret < 0) {
+		dev_err(efuse->dev, "failed to prepare/enable efuse clk\n");
+		goto unlock;
+	}
+
+	ret = regulator_set_voltage(efuse->vqps, RK3399_VQPS_MIN_UV, RK3399_VQPS_MAX_UV);
+	if (ret < 0) {
+		dev_err(efuse->dev, "failed to set vqps voltage\n");
+		clk_disable_unprepare(efuse->clk);
+		goto unlock;
+	}
+
+	ret = regulator_enable(efuse->vqps);
+	if (ret < 0) {
+		dev_err(efuse->dev, "failed to enable vqps regulator\n");
+		clk_disable_unprepare(efuse->clk);
+		goto unlock;
+	}
+
+	while (bytes--) {
+		u8 byte = *buf++;
+		int bit;
+
+		for (bit = 0; bit < 8; bit++) {
+			unsigned long flags;
+			u32 addr, ctrl;
+
+			if (!(byte & BIT(bit)))
+				continue;
+
+			addr = offset * 8 + bit;
+
+			/*
+			 * A_PGM mode (TRM table 23-3):
+			 * CSB=L, PGENB=L, PS=H, PD=L, LOAD=L, RSB=L,
+			 * STROBSFTSEL=H (software controls STROBE)
+			 * STROBE is asserted separately below.
+			 */
+			ctrl = RK3399_STROBSFTSEL | RK3399_PS |
+			       ((addr & RK3399_A_MASK) << RK3399_A_SHIFT);
+
+			writel(ctrl, efuse->base + REG_EFUSE_CTRL);
+			udelay(1);
+
+			local_irq_save(flags);
+			/* Assert STROBE to program the selected bit */
+			writel(ctrl | RK3399_STROBE, efuse->base + REG_EFUSE_CTRL);
+			udelay(RK3399_PGM_TIME_US);
+
+			/* Deassert STROBE */
+			writel(ctrl, efuse->base + REG_EFUSE_CTRL);
+			local_irq_restore(flags);
+			udelay(1);
+		}
+
+		offset++;
+	}
+
+	/* Return to standby mode: PD=H, CSB=H */
+	writel(RK3399_PD | RK3399_CSB, efuse->base + REG_EFUSE_CTRL);
+
+	regulator_disable(efuse->vqps);
+	clk_disable_unprepare(efuse->clk);
+
+unlock:
+	mutex_unlock(&efuse->lock);
+	return ret;
+}
+
+static const struct rockchip_efuse_soc_data rk3288_efuse_data = {
+	.reg_read = rockchip_rk3288_efuse_read,
+};
+
+static const struct rockchip_efuse_soc_data rk3328_efuse_data = {
+	.reg_read = rockchip_rk3328_efuse_read,
+};
+
+static const struct rockchip_efuse_soc_data rk3399_efuse_data = {
+	.reg_read  = rockchip_rk3399_efuse_read,
+	.reg_write = rockchip_rk3399_efuse_write,
 };
 
 static const struct of_device_id rockchip_efuse_match[] = {
 	/* deprecated but kept around for dts binding compatibility */
 	{
 		.compatible = "rockchip,rockchip-efuse",
-		.data = (void *)&rockchip_rk3288_efuse_read,
+		.data = &rk3288_efuse_data,
 	},
 	{
 		.compatible = "rockchip,rk3066a-efuse",
-		.data = (void *)&rockchip_rk3288_efuse_read,
+		.data = &rk3288_efuse_data,
 	},
 	{
 		.compatible = "rockchip,rk3188-efuse",
-		.data = (void *)&rockchip_rk3288_efuse_read,
+		.data = &rk3288_efuse_data,
 	},
 	{
 		.compatible = "rockchip,rk3228-efuse",
-		.data = (void *)&rockchip_rk3288_efuse_read,
+		.data = &rk3288_efuse_data,
 	},
 	{
 		.compatible = "rockchip,rk3288-efuse",
-		.data = (void *)&rockchip_rk3288_efuse_read,
+		.data = &rk3288_efuse_data,
 	},
 	{
 		.compatible = "rockchip,rk3368-efuse",
-		.data = (void *)&rockchip_rk3288_efuse_read,
+		.data = &rk3288_efuse_data,
 	},
 	{
 		.compatible = "rockchip,rk3328-efuse",
-		.data = (void *)&rockchip_rk3328_efuse_read,
+		.data = &rk3328_efuse_data,
 	},
 	{
 		.compatible = "rockchip,rk3399-efuse",
-		.data = (void *)&rockchip_rk3399_efuse_read,
+		.data = &rk3399_efuse_data,
 	},
 	{ /* sentinel */},
 };
@@ -252,22 +377,30 @@ MODULE_DEVICE_TABLE(of, rockchip_efuse_match);
 
 static int rockchip_efuse_probe(struct platform_device *pdev)
 {
-	struct resource *res;
-	struct nvmem_device *nvmem;
+	const struct rockchip_efuse_soc_data *soc_data;
 	struct rockchip_efuse_chip *efuse;
-	const void *data;
+	struct nvmem_device *nvmem;
+	struct nvmem_config econfig = {
+		.name              = "rockchip-efuse",
+		.add_legacy_fixed_of_cells = true,
+		.type              = NVMEM_TYPE_OTP,
+		.stride            = 1,
+		.word_size         = 1,
+	};
+	struct resource *res;
 	struct device *dev = &pdev->dev;
 
-	data = of_device_get_match_data(dev);
-	if (!data) {
+	soc_data = of_device_get_match_data(dev);
+	if (!soc_data) {
 		dev_err(dev, "failed to get match data\n");
 		return -EINVAL;
 	}
 
-	efuse = devm_kzalloc(dev, sizeof(struct rockchip_efuse_chip),
-			     GFP_KERNEL);
+	efuse = devm_kzalloc(dev, sizeof(*efuse), GFP_KERNEL);
 	if (!efuse)
 		return -ENOMEM;
+
+	mutex_init(&efuse->lock);
 
 	efuse->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(efuse->base))
@@ -278,12 +411,36 @@ static int rockchip_efuse_probe(struct platform_device *pdev)
 		return PTR_ERR(efuse->clk);
 
 	efuse->dev = dev;
+
 	if (of_property_read_u32(dev->of_node, "rockchip,efuse-size",
 				 &econfig.size))
 		econfig.size = resource_size(res);
-	econfig.reg_read = data;
-	econfig.priv = efuse;
-	econfig.dev = efuse->dev;
+
+	econfig.reg_read = soc_data->reg_read;
+	econfig.priv     = efuse;
+	econfig.dev      = dev;
+
+	/*
+	 * Enable write support only when a VQPS programming supply is
+	 * described in the device tree. Its presence is the hardware
+	 * declaration that irreversible OTP programming is intended on
+	 * this board. VQPS must be 0V during reads (the regulator is
+	 * only enabled inside the write callback).
+	 */
+	if (soc_data->reg_write) {
+		efuse->vqps = devm_regulator_get_optional(dev, "vqps");
+		if (!IS_ERR(efuse->vqps)) {
+			econfig.reg_write = soc_data->reg_write;
+		} else if (PTR_ERR(efuse->vqps) == -ENODEV) {
+			efuse->vqps = NULL;
+			dev_dbg(dev, "vqps supply absent, write support disabled\n");
+		} else {
+			return PTR_ERR(efuse->vqps);
+		}
+	}
+
+	econfig.read_only = !econfig.reg_write;
+
 	nvmem = devm_nvmem_register(dev, &econfig);
 
 	return PTR_ERR_OR_ZERO(nvmem);
@@ -300,3 +457,4 @@ static struct platform_driver rockchip_efuse_driver = {
 module_platform_driver(rockchip_efuse_driver);
 MODULE_DESCRIPTION("rockchip_efuse driver");
 MODULE_LICENSE("GPL v2");
+
